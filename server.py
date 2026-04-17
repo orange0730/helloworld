@@ -1,39 +1,23 @@
-"""FastAPI 後端：台語 ↔ 中文 雙向語音翻譯
+"""FastAPI 後端：台語 ↔ 中文 雙向語音翻譯（Replicate proxy 版）
 
-POST /translate   multipart form:
-    audio      : 16-bit PCM WAV，建議 16kHz 單聲道
-    src_lang   : hok | cmn
-    tgt_lang   : cmn | hok
-    with_speech: true | false   是否合成目標語言語音
+這支 server 不跑模型，只是代理呼叫 Replicate 上的 SeamlessM4T，
+主要目的：把 REPLICATE_API_TOKEN 藏在後端，不讓 App 直接拿到。
 
-Response JSON:
-    { "text": "...", "audio_b64": "<wav base64 或 null>" }
+啟動：
+    export REPLICATE_API_TOKEN=r8_xxx
+    python server.py
 """
 
 from __future__ import annotations
 
 import base64
-import io
 
-import torch
-import torchaudio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import AutoProcessor, SeamlessM4Tv2Model
 
-MODEL_ID = "facebook/seamless-m4t-v2-large"
-SAMPLE_RATE = 16000
-SUPPORTED = {"hok", "cmn"}
+from translator import MODEL, translate_speech
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = torch.float16 if device == "cuda" else torch.float32
-
-print(f"Loading {MODEL_ID} on {device} ...")
-processor = AutoProcessor.from_pretrained(MODEL_ID)
-model = SeamlessM4Tv2Model.from_pretrained(MODEL_ID, torch_dtype=dtype).to(device)
-model.eval()
-
-app = FastAPI(title="Taigi ↔ Mandarin Translator")
+app = FastAPI(title="Taigi ↔ Mandarin Translator (Replicate)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,22 +26,9 @@ app.add_middleware(
 )
 
 
-def _load_wav(raw: bytes) -> torch.Tensor:
-    waveform, sr = torchaudio.load(io.BytesIO(raw))
-    if sr != SAMPLE_RATE:
-        waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
-    return waveform.mean(dim=0, keepdim=True)
-
-
-def _encode_wav(waveform: torch.Tensor) -> str:
-    buf = io.BytesIO()
-    torchaudio.save(buf, waveform, SAMPLE_RATE, format="wav")
-    return base64.b64encode(buf.getvalue()).decode()
-
-
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "device": device, "model": MODEL_ID}
+    return {"status": "ok", "backend": "replicate", "model": MODEL}
 
 
 @app.post("/translate")
@@ -67,26 +38,22 @@ async def translate(
     tgt_lang: str = Form("cmn"),
     with_speech: bool = Form(True),
 ) -> dict:
-    if src_lang not in SUPPORTED or tgt_lang not in SUPPORTED:
-        raise HTTPException(400, f"lang must be one of {SUPPORTED}")
-    if src_lang == tgt_lang:
-        raise HTTPException(400, "src_lang and tgt_lang must differ")
+    raw = await audio.read()
+    try:
+        result = translate_speech(
+            audio_bytes=raw,
+            src_lang=src_lang,
+            tgt_lang=tgt_lang,
+            with_speech=with_speech,
+            filename=audio.filename or "input.wav",
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
 
-    waveform = _load_wav(await audio.read()).to(device)
-    inputs = processor(
-        audios=waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt"
-    ).to(device, dtype=dtype if device == "cuda" else torch.float32)
-
-    with torch.inference_mode():
-        text_ids = model.generate(**inputs, tgt_lang=tgt_lang, generate_speech=False)[0]
-        text = processor.decode(text_ids.squeeze().tolist(), skip_special_tokens=True)
-
-        audio_b64: str | None = None
-        if with_speech:
-            speech = model.generate(**inputs, tgt_lang=tgt_lang, generate_speech=True)[0]
-            audio_b64 = _encode_wav(speech.cpu().float().unsqueeze(0))
-
-    return {"text": text, "audio_b64": audio_b64}
+    audio_b64 = base64.b64encode(result.audio_wav).decode() if result.audio_wav else None
+    return {"text": result.text, "audio_b64": audio_b64}
 
 
 if __name__ == "__main__":
