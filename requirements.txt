@@ -1,0 +1,8 @@
+replicate>=0.32
+httpx>=0.27
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+gradio>=4.44
+soundfile>=0.12
+numpy<2
